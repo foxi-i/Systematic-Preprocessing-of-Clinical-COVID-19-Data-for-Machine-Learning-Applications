@@ -1,0 +1,2 @@
+# Systematic-Preprocessing-of-Clinical-COVID-19-Data-for-Machine-Learning-Applications
+This repository provides the full implementation for our study on systematic handling and preprocessing of clinical COVID-19 data for machine learning tasks. It includes data preparation pipelines, benchmark experiments, and visualization scripts to support reproducibility and future research in multimodal clinical modeling
