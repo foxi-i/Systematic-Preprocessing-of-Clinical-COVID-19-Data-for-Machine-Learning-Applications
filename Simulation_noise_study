@@ -1,0 +1,239 @@
+
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, f1_score, balanced_accuracy_score, roc_curve
+from sklearn.ensemble import IsolationForest
+from imblearn.under_sampling import OneSidedSelection
+
+import catboost as cb
+
+# =========================
+# SETTINGS
+# =========================
+SEEDS = [42, 52, 62, 72, 82]
+
+# =========================
+# MODEL
+# =========================
+def get_model(seed):
+    return cb.CatBoostClassifier(
+        iterations=1000,
+        loss_function="Logloss",
+        random_seed=seed,
+        verbose=0,
+        task_type="CPU",
+        thread_count=-1,
+        early_stopping_rounds=200
+    )
+
+# =========================
+# IFOSS PARAMS (FIXED)
+# =========================
+BEST_PARAMS = {
+    "max_samples": 2718,
+    "contamination": 0.17628539386580175,
+    "max_features": 0.3008788504656782,
+    "n_neighbors": 3,
+    "n_seeds_S": 153
+}
+
+# =========================
+# NOISE FUNCTIONS
+# =========================
+def inject_label_noise(y, ratio, seed):
+    rng = np.random.default_rng(seed)
+    y_noisy = y.copy()
+    idx = rng.choice(len(y), int(ratio * len(y)), replace=False)
+    y_noisy[idx] = 1 - y_noisy[idx]
+    return y_noisy
+
+
+def inject_feature_noise(X, ratio, seed, scale=3):
+    rng = np.random.default_rng(seed)
+    X_noisy = X.copy()
+    mask = rng.random(len(X)) < ratio
+
+    for col in X.columns:
+        if X[col].dtype == "object" or str(X[col].dtype).startswith("category"):
+            continue
+
+        std = X_noisy[col].std()
+        if std == 0 or np.isnan(std):
+            continue
+
+        noise = rng.normal(0, scale * std, size=mask.sum())
+        X_noisy.loc[mask, col] += noise
+
+    return X_noisy
+
+
+def create_imbalance(X, y, ratio=0.1, seed=42):
+    df = X.copy()
+    df["target"] = y
+
+    minority = df[df["target"] == 1]
+    majority = df[df["target"] == 0]
+
+    n_min = len(minority)
+    n_majority = int((1 - ratio) / ratio * n_min)
+    n_majority = min(n_majority, len(majority))
+
+    majority_down = majority.sample(n=n_majority, random_state=seed)
+
+    df_new = pd.concat([majority_down, minority]).sample(frac=1, random_state=seed)
+
+    return df_new.drop(columns="target"), df_new["target"]
+
+
+# =========================
+# IFOSS
+# =========================
+def apply_ifoss(X, y, seed):
+
+    iso = IsolationForest(
+        max_samples=BEST_PARAMS["max_samples"],
+        contamination=BEST_PARAMS["contamination"],
+        max_features=BEST_PARAMS["max_features"],
+        random_state=seed
+    )
+
+    mask = iso.fit_predict(X) == 1
+    X_clean, y_clean = X[mask], y[mask]
+
+    oss = OneSidedSelection(
+        n_neighbors=BEST_PARAMS["n_neighbors"],
+        n_seeds_S=BEST_PARAMS["n_seeds_S"],
+        random_state=seed
+    )
+
+    X_res, y_res = oss.fit_resample(X_clean, y_clean)
+
+    if len(X_res) < 50:
+        return X, y
+
+    return X_res, y_res
+
+
+# =========================
+# THRESHOLD (VALIDATION ONLY!)
+# =========================
+def find_best_threshold(y_true, proba):
+    fpr, tpr, thr = roc_curve(y_true, proba)
+    J = tpr - fpr
+    return thr[np.argmax(J)]
+
+
+# =========================
+# METRICS
+# =========================
+def evaluate(y_true, proba, thr):
+
+    pred = (proba >= thr).astype(int)
+
+    fpr, tpr, _ = roc_curve(y_true, proba)
+    sens = tpr[np.argmax(tpr - fpr)]
+    spec = 1 - fpr[np.argmax(tpr - fpr)]
+
+    gmean = np.sqrt(max(sens, 0) * max(spec, 0))
+
+    return {
+        "AUC": roc_auc_score(y_true, proba),
+        "F1": f1_score(y_true, pred, average="weighted", zero_division=0),
+        "BalAcc": balanced_accuracy_score(y_true, pred),
+        "GMean": gmean
+    }
+
+
+# =========================
+# CONFIG
+# =========================
+configs = [
+    {"name": "clean", "ln": 0, "fn": 0, "imb": None},
+    {"name": "label_noise_20", "ln": 0.2, "fn": 0, "imb": None},
+    {"name": "feature_noise_20", "ln": 0, "fn": 0.2, "imb": None},
+    {"name": "imbalance_90_10", "ln": 0, "fn": 0, "imb": 0.1},
+    {"name": "combined", "ln": 0.2, "fn": 0.2, "imb": 0.1},
+]
+
+# =========================
+# DATA (FULL DATASET)
+# =========================
+cat_cols = [c for c in X.columns if X[c].dtype == "object" or str(X[c].dtype).startswith("category")]
+cat_idx = [X.columns.get_loc(c) for c in cat_cols]
+
+y_np = np.asarray(y)
+
+# =========================
+# RUN
+# =========================
+results = []
+
+for cfg in configs:
+
+    all_runs = []
+
+    for seed in SEEDS:
+
+        # ---- 1. APPLY NOISE BEFORE SPLIT ----
+        X_sim = X.copy()
+        y_sim = y_np.copy()
+
+        if cfg["ln"] > 0:
+            y_sim = inject_label_noise(y_sim, cfg["ln"], seed)
+
+        if cfg["fn"] > 0:
+            X_sim = inject_feature_noise(X_sim, cfg["fn"], seed)
+
+        if cfg["imb"] is not None:
+            X_sim, y_sim = create_imbalance(X_sim, y_sim, cfg["imb"], seed)
+
+        # ---- 2. SPLIT ----
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_sim, y_sim, test_size=0.2, stratify=y_sim, random_state=seed
+        )
+
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train, y_train, test_size=0.2, stratify=y_train, random_state=seed
+        )
+
+        # ---- BASELINE ----
+        model = get_model(seed)
+        model.fit(X_tr, y_tr, eval_set=(X_val, y_val),
+                  cat_features=cat_idx, use_best_model=True)
+
+        val_proba = model.predict_proba(X_val)[:, 1]
+        thr = find_best_threshold(y_val, val_proba)
+
+        test_proba = model.predict_proba(X_test)[:, 1]
+        base = evaluate(y_test, test_proba, thr)
+
+        # ---- IFOSS ----
+        X_if, y_if = apply_ifoss(X_tr, y_tr, seed)
+
+        model = get_model(seed)
+        model.fit(X_if, y_if, eval_set=(X_val, y_val),
+                  cat_features=cat_idx, use_best_model=True)
+
+        val_proba = model.predict_proba(X_val)[:, 1]
+        thr = find_best_threshold(y_val, val_proba)
+
+        test_proba = model.predict_proba(X_test)[:, 1]
+        ifoss = evaluate(y_test, test_proba, thr)
+
+        all_runs.append([base, ifoss])
+
+    base_df = pd.DataFrame([x[0] for x in all_runs])
+    ifoss_df = pd.DataFrame([x[1] for x in all_runs])
+
+    results.append({
+        "Condition": cfg["name"],
+        "ΔAUC": (ifoss_df['AUC'] - base_df['AUC']).mean(),
+        "ΔF1": (ifoss_df['F1'] - base_df['F1']).mean(),
+        "ΔBalAcc": (ifoss_df['BalAcc'] - base_df['BalAcc']).mean(),
+        "ΔGMean": (ifoss_df['GMean'] - base_df['GMean']).mean(),
+    })
+
+print(pd.DataFrame(results))
