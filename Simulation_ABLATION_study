@@ -1,0 +1,175 @@
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, f1_score, balanced_accuracy_score, roc_curve, confusion_matrix
+from sklearn.ensemble import IsolationForest
+from imblearn.under_sampling import OneSidedSelection
+
+import catboost as cb
+
+SEEDS = [42, 52, 62, 72, 82]
+
+# =========================
+# MODEL
+# =========================
+def get_model(seed):
+    return cb.CatBoostClassifier(
+        iterations=1000,
+        loss_function="Logloss",
+        random_seed=seed,
+        verbose=0,
+        early_stopping_rounds=200
+    )
+
+# =========================
+# IFOSS PARAMS
+# =========================
+BEST_IFOSS = {
+    "max_samples": 2718,
+    "contamination": 0.17628539386580175,
+    "max_features": 0.3008788504656782,
+    "n_neighbors": 3,
+    "n_seeds_S": 153
+}
+
+# =========================
+# DATA
+# =========================
+cat_cols = [c for c in X.columns if X[c].dtype == "object" or str(X[c].dtype).startswith("category")]
+cat_idx = [X.columns.get_loc(c) for c in cat_cols]
+
+y_np = np.asarray(y)
+
+# =========================
+# METRICS
+# =========================
+def find_thr(y_true, proba):
+    fpr, tpr, thr = roc_curve(y_true, proba)
+    return thr[np.argmax(tpr - fpr)]
+
+def compute_gmean(y_true, y_pred):
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    sens = tp / (tp + fn) if (tp + fn) > 0 else 0
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0
+    return np.sqrt(sens * spec)
+
+def evaluate(y_true, proba, thr):
+    pred = (proba >= thr).astype(int)
+    return {
+        "AUC": roc_auc_score(y_true, proba),
+        "F1_weighted": f1_score(y_true, pred, average="weighted", zero_division=0),
+        "BalAcc": balanced_accuracy_score(y_true, pred),
+        "GMean": compute_gmean(y_true, pred)
+    }
+
+# =========================
+# COMPONENTS
+# =========================
+def apply_if(X, y, seed):
+    iso = IsolationForest(
+        max_samples=BEST_IFOSS["max_samples"],
+        contamination=BEST_IFOSS["contamination"],
+        max_features=BEST_IFOSS["max_features"],
+        random_state=seed
+    )
+    mask = iso.fit_predict(X) == 1
+    return X[mask], y[mask]
+
+def apply_oss(X, y, seed):
+    oss = OneSidedSelection(
+        n_neighbors=BEST_IFOSS["n_neighbors"],
+        n_seeds_S=BEST_IFOSS["n_seeds_S"],
+        random_state=seed
+    )
+    return oss.fit_resample(X, y)
+
+# =========================
+# RUN
+# =========================
+steps = ["Baseline", "+IF", "+OSS", "IF→OSS", "OSS→IF"]
+all_results = {k: [] for k in steps}
+
+print("\n===== STARTING ABLATION =====")
+
+for i, seed in enumerate(SEEDS):
+
+    print(f"\n[Seed {i+1}/{len(SEEDS)}] seed={seed}")
+
+    # ---- split ----
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_np, test_size=0.2, stratify=y_np, random_state=seed
+    )
+
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train, y_train, test_size=0.2, stratify=y_train, random_state=seed
+    )
+
+    def run_pipeline(X_in, y_in):
+        print(f"   Training size: {len(X_in)}")
+
+        model = get_model(seed)
+
+        model.fit(
+            X_in, y_in,
+            eval_set=(X_val, y_val),
+            cat_features=cat_idx,
+            use_best_model=True,
+            verbose=0
+        )
+
+        val_proba = model.predict_proba(X_val)[:, 1]
+        thr = find_thr(y_val, val_proba)
+
+        test_proba = model.predict_proba(X_test)[:, 1]
+        return evaluate(y_test, test_proba, thr)
+
+    # ---- Baseline ----
+    print("  -> Baseline")
+    all_results["Baseline"].append(run_pipeline(X_tr, y_tr))
+
+    # ---- IF ----
+    print("  -> +IF")
+    X_if, y_if = apply_if(X_tr, y_tr, seed)
+    all_results["+IF"].append(run_pipeline(X_if, y_if))
+
+    # ---- OSS ----
+    print("  -> +OSS")
+    X_oss, y_oss = apply_oss(X_tr, y_tr, seed)
+    all_results["+OSS"].append(run_pipeline(X_oss, y_oss))
+
+    # ---- IF → OSS ----
+    print("  -> IF → OSS")
+    X_if, y_if = apply_if(X_tr, y_tr, seed)
+    X_ifoss, y_ifoss = apply_oss(X_if, y_if, seed)
+    all_results["IF→OSS"].append(run_pipeline(X_ifoss, y_ifoss))
+
+    # ---- OSS → IF ----
+    print("  -> OSS → IF")
+    X_oss, y_oss = apply_oss(X_tr, y_tr, seed)
+    X_rev, y_rev = apply_if(X_oss, y_oss, seed)
+    all_results["OSS→IF"].append(run_pipeline(X_rev, y_rev))
+
+print("\n===== ABLATION COMPLETE =====")
+
+# =========================
+# AGGREGATE
+# =========================
+rows = []
+
+for step in steps:
+    df = pd.DataFrame(all_results[step])
+
+    rows.append({
+        "Step": step,
+        "AUC": f"{df['AUC'].mean():.4f} ± {df['AUC'].std():.4f}",
+        "F1_weighted": f"{df['F1_weighted'].mean():.4f} ± {df['F1_weighted'].std():.4f}",
+        "BalAcc": f"{df['BalAcc'].mean():.4f} ± {df['BalAcc'].std():.4f}",
+        "GMean": f"{df['GMean'].mean():.4f} ± {df['GMean'].std():.4f}",
+    })
+
+df_final = pd.DataFrame(rows)
+
+print("\n===== FINAL ABLATION TABLE =====")
+print(df_final.to_markdown(index=False))
